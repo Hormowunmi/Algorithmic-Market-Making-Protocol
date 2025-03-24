@@ -508,3 +508,108 @@
           updated-user-pos
         )
       )
+       ;; Increment position ID counter
+      (var-set next-position-id (+ position-id u1))
+      
+      (ok { 
+        position-id: position-id, 
+        lp-units: lp-units,
+        amount-x: amount-x,
+        amount-y: amount-y,
+        range-status: range-status
+      })
+    )
+  )
+)
+
+;; Helper function to add to concentrated liquidity ranges
+(define-private (add-to-ranges
+  (ranges (list 10 { tick-lower: int, tick-upper: int, liquidity: uint, positions-count: uint }))
+  (tick-lower int)
+  (tick-upper int)
+  (new-liquidity uint))
+  
+  ;; Find existing range or add new one
+  (let (
+    (existing-range-index (find-range ranges tick-lower tick-upper))
+  )
+    (if (is-some existing-range-index)
+      ;; Update existing range
+      (let (
+        (range-index (unwrap-panic existing-range-index))
+        (range (unwrap-panic (element-at ranges range-index)))
+      )
+        (replace-at 
+          ranges 
+          range-index 
+          (merge range {
+            liquidity: (+ (get liquidity range) new-liquidity),
+            positions-count: (+ (get positions-count range) u1)
+          })
+        )
+      )
+      ;; Add new range
+      (if (< (len ranges) u10)
+        (append ranges {
+          tick-lower: tick-lower,
+          tick-upper: tick-upper,
+          liquidity: new-liquidity,
+          positions-count: u1
+        })
+        ;; Merge with closest range if list is full
+        (let (
+          (closest-range-index (find-closest-range ranges tick-lower tick-upper))
+          (closest-range (unwrap-panic (element-at ranges closest-range-index)))
+        )
+          (replace-at 
+            ranges 
+            closest-range-index 
+            (merge closest-range {
+              tick-lower: (min (get tick-lower closest-range) tick-lower),
+              tick-upper: (max (get tick-upper closest-range) tick-upper),
+              liquidity: (+ (get liquidity closest-range) new-liquidity),
+              positions-count: (+ (get positions-count closest-range) u1)
+            })
+          )
+        )
+      )
+    )
+  )
+)
+
+;; Helper to find an existing range
+(define-private (find-range 
+  (ranges (list 10 { tick-lower: int, tick-upper: int, liquidity: uint, positions-count: uint }))
+  (tick-lower int)
+  (tick-upper int))
+  
+  (find-range-index ranges tick-lower tick-upper u0)
+)
+
+;; Helper to find range index
+(define-private (find-range-index
+  (ranges (list 10 { tick-lower: int, tick-upper: int, liquidity: uint, positions-count: uint }))
+  (tick-lower int)
+  (tick-upper int)
+  (index uint))
+  
+  (if (>= index (len ranges))
+    none
+    (let (
+      (range (unwrap-panic (element-at ranges index)))
+    )
+      (if (and (is-eq (get tick-lower range) tick-lower) (is-eq (get tick-upper range) tick-upper))
+        (some index)
+        (find-range-index ranges tick-lower tick-upper (+ index u1))
+      )
+    )
+  )
+)
+
+;; Helper to find closest range for merging
+(define-private (find-closest-range
+  (ranges (list 10 { tick-lower: int, tick-upper: int, liquidity: uint, positions-count: uint }))
+  (tick-lower int)
+  (tick-upper int))
+  
+  
