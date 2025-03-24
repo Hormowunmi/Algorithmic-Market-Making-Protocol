@@ -455,4 +455,56 @@
       ;; Transfer tokens to pool
       (try! (transfer-token token-x amount-x provider (as-contract tx-sender)))
       (try! (transfer-token token-y amount-y provider (as-contract tx-sender)))
+      ;; Update pool state
+      (map-set liquidity-pools
+        { pool-id: pool-id }
+        (merge pool {
+          reserve-x: (+ (get reserve-x pool) amount-x),
+          reserve-y: (+ (get reserve-y pool) amount-y),
+          liquidity-units: (+ (get liquidity-units pool) lp-units),
+          last-update-block: block-height,
+          concentrated-ranges: (add-to-ranges 
+                                 (get concentrated-ranges pool) 
+                                 tick-lower 
+                                 tick-upper 
+                                 lp-units)
+        })
+      )
       
+      ;; Create liquidity position
+      (map-set liquidity-positions
+        { position-id: position-id }
+        {
+          pool-id: pool-id,
+          provider: provider,
+          liquidity-units: lp-units,
+          token-x-amount: amount-x,
+          token-y-amount: amount-y,
+          entry-price: (calculate-price pool),
+          entry-sqrt-price: price-sqrt,
+          entry-block: block-height,
+          last-update-block: block-height,
+          tick-lower: tick-lower,
+          tick-upper: tick-upper,
+          range-status: range-status,
+          fees-earned-x: u0,
+          fees-earned-y: u0,
+          rewards-earned: u0,
+          rewards-claimed: u0,
+          il-compensation: u0,
+          is-concentrated: true
+        }
+      )
+      
+      ;; Update user's positions list
+      (let (
+        (user-pos (default-to { position-ids: (list) } (map-get? user-positions { user: provider })))
+        (updated-user-pos (merge user-pos {
+          position-ids: (append (get position-ids user-pos) position-id)
+        }))
+      )
+        (map-set user-positions
+          { user: provider }
+          updated-user-pos
+        )
+      )
