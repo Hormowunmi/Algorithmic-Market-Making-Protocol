@@ -455,4 +455,231 @@
       ;; Transfer tokens to pool
       (try! (transfer-token token-x amount-x provider (as-contract tx-sender)))
       (try! (transfer-token token-y amount-y provider (as-contract tx-sender)))
+      ;; Update pool state
+      (map-set liquidity-pools
+        { pool-id: pool-id }
+        (merge pool {
+          reserve-x: (+ (get reserve-x pool) amount-x),
+          reserve-y: (+ (get reserve-y pool) amount-y),
+          liquidity-units: (+ (get liquidity-units pool) lp-units),
+          last-update-block: block-height,
+          concentrated-ranges: (add-to-ranges 
+                                 (get concentrated-ranges pool) 
+                                 tick-lower 
+                                 tick-upper 
+                                 lp-units)
+        })
+      )
       
+      ;; Create liquidity position
+      (map-set liquidity-positions
+        { position-id: position-id }
+        {
+          pool-id: pool-id,
+          provider: provider,
+          liquidity-units: lp-units,
+          token-x-amount: amount-x,
+          token-y-amount: amount-y,
+          entry-price: (calculate-price pool),
+          entry-sqrt-price: price-sqrt,
+          entry-block: block-height,
+          last-update-block: block-height,
+          tick-lower: tick-lower,
+          tick-upper: tick-upper,
+          range-status: range-status,
+          fees-earned-x: u0,
+          fees-earned-y: u0,
+          rewards-earned: u0,
+          rewards-claimed: u0,
+          il-compensation: u0,
+          is-concentrated: true
+        }
+      )
+      
+      ;; Update user's positions list
+      (let (
+        (user-pos (default-to { position-ids: (list) } (map-get? user-positions { user: provider })))
+        (updated-user-pos (merge user-pos {
+          position-ids: (append (get position-ids user-pos) position-id)
+        }))
+      )
+        (map-set user-positions
+          { user: provider }
+          updated-user-pos
+        )
+      )
+       ;; Increment position ID counter
+      (var-set next-position-id (+ position-id u1))
+      
+      (ok { 
+        position-id: position-id, 
+        lp-units: lp-units,
+        amount-x: amount-x,
+        amount-y: amount-y,
+        range-status: range-status
+      })
+    )
+  )
+)
+
+;; Helper function to add to concentrated liquidity ranges
+(define-private (add-to-ranges
+  (ranges (list 10 { tick-lower: int, tick-upper: int, liquidity: uint, positions-count: uint }))
+  (tick-lower int)
+  (tick-upper int)
+  (new-liquidity uint))
+  
+  ;; Find existing range or add new one
+  (let (
+    (existing-range-index (find-range ranges tick-lower tick-upper))
+  )
+    (if (is-some existing-range-index)
+      ;; Update existing range
+      (let (
+        (range-index (unwrap-panic existing-range-index))
+        (range (unwrap-panic (element-at ranges range-index)))
+      )
+        (replace-at 
+          ranges 
+          range-index 
+          (merge range {
+            liquidity: (+ (get liquidity range) new-liquidity),
+            positions-count: (+ (get positions-count range) u1)
+          })
+        )
+      )
+      ;; Add new range
+      (if (< (len ranges) u10)
+        (append ranges {
+          tick-lower: tick-lower,
+          tick-upper: tick-upper,
+          liquidity: new-liquidity,
+          positions-count: u1
+        })
+        ;; Merge with closest range if list is full
+        (let (
+          (closest-range-index (find-closest-range ranges tick-lower tick-upper))
+          (closest-range (unwrap-panic (element-at ranges closest-range-index)))
+        )
+          (replace-at 
+            ranges 
+            closest-range-index 
+            (merge closest-range {
+              tick-lower: (min (get tick-lower closest-range) tick-lower),
+              tick-upper: (max (get tick-upper closest-range) tick-upper),
+              liquidity: (+ (get liquidity closest-range) new-liquidity),
+              positions-count: (+ (get positions-count closest-range) u1)
+            })
+          )
+        )
+      )
+    )
+  )
+)
+
+;; Helper to find an existing range
+(define-private (find-range 
+  (ranges (list 10 { tick-lower: int, tick-upper: int, liquidity: uint, positions-count: uint }))
+  (tick-lower int)
+  (tick-upper int))
+  
+  (find-range-index ranges tick-lower tick-upper u0)
+)
+
+;; Helper to find range index
+(define-private (find-range-index
+  (ranges (list 10 { tick-lower: int, tick-upper: int, liquidity: uint, positions-count: uint }))
+  (tick-lower int)
+  (tick-upper int)
+  (index uint))
+  
+  (if (>= index (len ranges))
+    none
+    (let (
+      (range (unwrap-panic (element-at ranges index)))
+    )
+      (if (and (is-eq (get tick-lower range) tick-lower) (is-eq (get tick-upper range) tick-upper))
+        (some index)
+        (find-range-index ranges tick-lower tick-upper (+ index u1))
+      )
+    )
+  )
+)
+
+;; Helper to find closest range for merging
+(define-private (find-closest-range
+  (ranges (list 10 { tick-lower: int, tick-upper: int, liquidity: uint, positions-count: uint }))
+  (tick-lower int)
+  (tick-upper int))
+  
+   ;; For simplicity, return the first range with lowest liquidity
+  ;; In a real implementation, you would calculate distance metrics
+  (let (
+    (min-index (find-min-liquidity-range ranges u0 u0 u0))
+  )
+    (if (< min-index (len ranges))
+      (some min-index)
+      (some u0)
+    )
+  )
+)
+
+;; Helper to find the range with lowest liquidity
+(define-private (find-min-liquidity-range
+  (ranges (list 10 { tick-lower: int, tick-upper: int, liquidity: uint, positions-count: uint }))
+  (index uint)
+  (min-index uint)
+  (min-liquidity uint))
+  
+  (if (>= index (len ranges))
+    min-index
+    (let (
+      (range (unwrap-panic (element-at ranges index)))
+      (liquidity (get liquidity range))
+    )
+      (if (or (is-eq min-liquidity u0) (< liquidity min-liquidity))
+        (find-min-liquidity-range ranges (+ index u1) index liquidity)
+        (find-min-liquidity-range ranges (+ index u1) min-index min-liquidity)
+      )
+    )
+  )
+)
+
+;; Remove liquidity from a pool
+(define-public (remove-liquidity
+  (position-id uint)
+  (lp-units uint)
+  (min-amount-x uint)
+  (min-amount-y uint))
+  
+  (let (
+    (provider tx-sender)
+    (position (unwrap! (map-get? liquidity-positions { position-id: position-id }) err-position-not-found))
+    (pool-id (get pool-id position))
+    (pool (unwrap! (map-get? liquidity-pools { pool-id: pool-id }) err-pool-not-found))
+    (token-x (get token-x pool))
+    (token-y (get token-y pool))
+  )
+    ;; Validation
+    (asserts! (not (var-get emergency-shutdown)) err-emergency-shutdown)
+    (asserts! (is-eq provider (get provider position)) err-not-authorized)
+    (asserts! (> lp-units u0) err-zero-amount)
+    (asserts! (<= lp-units (get liquidity-units position)) err-insufficient-balance)
+    
+    ;; Calculate amounts to return
+    (let (
+      (pool-liquidity (get liquidity-units pool))
+      (position-liquidity (get liquidity-units position))
+      (withdrawal-percentage (/ (* lp-units u10000) position-liquidity))
+      (amount-x-position (get token-x-amount position))
+      (amount-y-position (get token-y-amount position))
+      (amount-x-to-return (/ (* amount-x-position withdrawal-percentage) u10000))
+      (amount-y-to-return (/ (* amount-y-position withdrawal-percentage) u10000))
+      (fees-earned-x (get fees-earned-x position))
+      (fees-earned-y (get fees-earned-y position))
+      (fees-x-to-return (/ (* fees-earned-x withdrawal-percentage) u10000))
+      (fees-y-to-return (/ (* fees-earned-y withdrawal-percentage) u10000))
+      (il-compensation (get il-compensation position))
+      (il-to-return (/ (* il-compensation withdrawal-percentage) u10000))
+    )
+    )
