@@ -221,3 +221,238 @@
     (ok token-id)
   )
 )
+;; Create a new liquidity pool
+(define-public (create-pool
+  (token-x (string-ascii 20))
+  (token-y (string-ascii 20))
+  (curve-type uint)
+  (curve-params (list 5 uint))
+  (base-fee-bp uint)
+  (tick-spacing uint))
+  
+  (let (
+    (pool-id (var-get next-pool-id))
+    (token-x-info (unwrap! (map-get? token-registry { token-id: token-x }) err-token-not-found))
+    (token-y-info (unwrap! (map-get? token-registry { token-id: token-y }) err-token-not-found))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (not (var-get emergency-shutdown)) err-emergency-shutdown)
+    (asserts! (< curve-type u4) err-invalid-curve) ;; Valid curve type
+    (asserts! (<= base-fee-bp u500) err-invalid-parameters) ;; Max 5% base fee
+    (asserts! (> tick-spacing u0) err-invalid-parameters) ;; Tick spacing must be positive
+    
+    ;; Create pool
+    (map-set liquidity-pools
+      { pool-id: pool-id }
+      {
+        token-x: token-x,
+        token-y: token-y,
+        reserve-x: u0,
+        reserve-y: u0,
+        virtual-reserve-x: u0,
+        virtual-reserve-y: u0,
+        liquidity-units: u0,
+        curve-type: curve-type,
+        curve-params: curve-params,
+        base-fee-bp: base-fee-bp,
+        dynamic-fee-bp: u0, ;; Start with no dynamic fee
+        current-tick: (convert-to-int 0), ;; Start at price = 1.0
+        tick-spacing: tick-spacing,
+        price-oracle: (get price-oracle token-x-info), ;; Use token X's oracle by default
+        total-volume-x: u0,
+        total-volume-y: u0,
+        total-fees-x: u0,
+        total-fees-y: u0,
+        total-fees-protocol: u0,
+        creation-block: block-height,
+        last-update-block: block-height,
+        status: u0, ;; Active
+        price-history: (list),
+        volatility-adjustment: u1000, ;; Start with 10% volatility adjustment
+        concentrated-ranges: (list),
+        total-il-compensation-paid: u0
+      }
+    )
+    
+    ;; Initialize pool positions list
+    (map-set pool-positions
+      { pool-id: pool-id }
+      { position-ids: (list) }
+    )
+    
+    ;; Increment pool ID counter
+    (var-set next-pool-id (+ pool-id u1))
+    
+    (ok { pool-id: pool-id })
+  )
+)
+
+;; Add standard liquidity to a pool
+(define-public (add-liquidity
+  (pool-id uint)
+  (amount-x uint)
+  (amount-y uint)
+  (min-lp-units uint))
+  
+  (let (
+    (provider tx-sender)
+    (pool (unwrap! (map-get? liquidity-pools { pool-id: pool-id }) err-pool-not-found))
+    (token-x (get token-x pool))
+    (token-y (get token-y pool))
+    (token-x-info (unwrap! (map-get? token-registry { token-id: token-x }) err-token-not-found))
+    (token-y-info (unwrap! (map-get? token-registry { token-id: token-y }) err-token-not-found))
+    (position-id (var-get next-position-id))
+  )
+    ;; Validation
+    (asserts! (not (var-get emergency-shutdown)) err-emergency-shutdown)
+    (asserts! (is-eq (get status pool) u0) err-paused) ;; Pool must be active
+    (asserts! (> amount-x u0) err-zero-amount)
+    (asserts! (> amount-y u0) err-zero-amount)
+    (asserts! (>= amount-x (var-get min-deposit-amount)) err-min-deposit) ;; Minimum deposit
+    (asserts! (>= amount-y (var-get min-deposit-amount)) err-min-deposit) ;; Minimum deposit
+    
+    ;; Calculate liquidity units (LP tokens)
+    (let (
+      (current-liquidity (get liquidity-units pool))
+      (reserve-x (get reserve-x pool))
+      (reserve-y (get reserve-y pool))
+      (lp-units (if (is-eq current-liquidity u0)
+                   ;; First liquidity provision - use geometric mean
+                   (sqrti (* amount-x amount-y))
+                   ;; Proportional to existing reserves
+                   (min
+                     (/ (* amount-x current-liquidity) reserve-x)
+                     (/ (* amount-y current-liquidity) reserve-y)
+                   )))
+    )
+      ;; Ensure minimum liquidity
+      (asserts! (>= lp-units min-lp-units) err-slippage-too-high)
+      
+      ;; Transfer tokens to pool
+      (try! (transfer-token token-x amount-x provider (as-contract tx-sender)))
+      (try! (transfer-token token-y amount-y provider (as-contract tx-sender)))
+      
+      ;; Update pool state
+      (map-set liquidity-pools
+        { pool-id: pool-id }
+        (merge pool {
+          reserve-x: (+ reserve-x amount-x),
+          reserve-y: (+ reserve-y amount-y),
+          liquidity-units: (+ current-liquidity lp-units),
+          last-update-block: block-height
+        })
+      )
+      
+      ;; Create liquidity position
+      (map-set liquidity-positions
+        { position-id: position-id }
+        {
+          pool-id: pool-id,
+          provider: provider,
+          liquidity-units: lp-units,
+          token-x-amount: amount-x,
+          token-y-amount: amount-y,
+          entry-price: (calculate-price pool),
+          entry-sqrt-price: (sqrti (/ reserve-y reserve-x)),
+          entry-block: block-height,
+          last-update-block: block-height,
+          tick-lower: (convert-to-int 0), ;; Full range
+          tick-upper: (convert-to-int 0), ;; Full range
+          range-status: u1, ;; In-range
+          fees-earned-x: u0,
+          fees-earned-y: u0,
+          rewards-earned: u0,
+          rewards-claimed: u0,
+          il-compensation: u0,
+          is-concentrated: false
+        }
+      )
+      
+      ;; Update user's positions list
+      (let (
+        (user-pos (default-to { position-ids: (list) } (map-get? user-positions { user: provider })))
+        (updated-user-pos (merge user-pos {
+          position-ids: (append (get position-ids user-pos) position-id)
+        }))
+      )
+        (map-set user-positions
+          { user: provider }
+          updated-user-pos
+        )
+      )
+      
+      ;; Update pool's positions list
+      (let (
+        (pool-pos (default-to { position-ids: (list) } (map-get? pool-positions { pool-id: pool-id })))
+        (updated-pool-pos (merge pool-pos {
+          position-ids: (append (get position-ids pool-pos) position-id)
+        }))
+      )
+        (map-set pool-positions
+          { pool-id: pool-id }
+          updated-pool-pos
+        )
+      )
+      
+      ;; Increment position ID counter
+      (var-set next-position-id (+ position-id u1))
+      
+      (ok { 
+        position-id: position-id, 
+        lp-units: lp-units,
+        amount-x: amount-x,
+        amount-y: amount-y 
+      })
+    )
+  )
+)
+
+;; Add concentrated liquidity within a specific price range
+(define-public (add-concentrated-liquidity
+  (pool-id uint)
+  (amount-x uint)
+  (amount-y uint)
+  (tick-lower int)
+  (tick-upper int)
+  (min-lp-units uint))
+  
+  (let (
+    (provider tx-sender)
+    (pool (unwrap! (map-get? liquidity-pools { pool-id: pool-id }) err-pool-not-found))
+    (token-x (get token-x pool))
+    (token-y (get token-y pool))
+    (token-x-info (unwrap! (map-get? token-registry { token-id: token-x }) err-token-not-found))
+    (token-y-info (unwrap! (map-get? token-registry { token-id: token-y }) err-token-not-found))
+    (position-id (var-get next-position-id))
+    (current-tick (get current-tick pool))
+    (tick-spacing (get tick-spacing pool))
+  )
+    ;; Validation
+    (asserts! (not (var-get emergency-shutdown)) err-emergency-shutdown)
+    (asserts! (is-eq (get status pool) u0) err-paused) ;; Pool must be active
+    (asserts! (> amount-x u0) err-zero-amount)
+    (asserts! (> amount-y u0) err-zero-amount)
+    (asserts! (>= amount-x (var-get min-deposit-amount)) err-min-deposit) ;; Minimum deposit
+    (asserts! (>= amount-y (var-get min-deposit-amount)) err-min-deposit) ;; Minimum deposit
+    (asserts! (< tick-lower tick-upper) err-range-invalid) ;; Valid range
+    
+    ;; Ensure ticks are on the spacing grid
+    (asserts! (is-eq (mod tick-lower (convert-to-int tick-spacing)) (convert-to-int 0)) err-invalid-parameters)
+    (asserts! (is-eq (mod tick-upper (convert-to-int tick-spacing)) (convert-to-int 0)) err-invalid-parameters)
+    
+    ;; Calculate liquidity provision based on range
+    (let (
+      (price-sqrt (sqrti (/ (get reserve-y pool) (get reserve-x pool))))
+      (lower-price-sqrt (calculate-sqrt-price-from-tick tick-lower))
+      (upper-price-sqrt (calculate-sqrt-price-from-tick tick-upper))
+      (is-current-in-range (and (>= current-tick tick-lower) (< current-tick tick-upper)))
+      (range-status (if is-current-in-range u1 u0)) ;; 1=In-range, 0=Out-of-range
+      (lp-units (calculate-concentrated-liquidity amount-x amount-y price-sqrt lower-price-sqrt upper-price-sqrt))
+    )
+      ;; Ensure minimum liquidity
+      (asserts! (>= lp-units min-lp-units) err-slippage-too-high)
+      
+      ;; Transfer tokens to pool
+      (try! (transfer-token token-x amount-x provider (as-contract tx-sender)))
+      (try! (transfer-token token-y amount-y provider (as-contract tx-sender)))
+      
